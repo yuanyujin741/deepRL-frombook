@@ -27,4 +27,5 @@ for t in range(100):
         print("Finished")
         state = env.reset()  # Reset the environment
 
+
 env.close()  # Close the environment
