@@ -1,0 +1,15 @@
+"""
+这样创建的二维列表 b，每一行其实是同一个对象的引用。导致后面赋值时，所有行都会一起变化。
+比如你执行 b[j][i] = a[i][j]，会发现所有行的第 i 列都被修改了。
+"""
+def transpose_matrix(a: list[list[int|float]]) -> list[list[int|float]]:
+    row1 = len(a)
+    column1= len(a[0])
+    row2 = column1
+    column2 = row1
+    b = [[0 for _ in range(column2)] for _ in range(row2)]
+    for i in range(row1):
+        for j in range(column1):
+            b[j][i] = a[i][j]
+    return b
+print(transpose_matrix([[1,2,3],[4,5,6]]))
