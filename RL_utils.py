@@ -3,6 +3,7 @@ import torch.nn as nn
 import time
 import numpy as np
 
+# region general thing
 class Config():
     """
     用于配置整个算法的参数
@@ -64,9 +65,10 @@ def save_model(model = None, filename = "xxxmodel.pth"):
         print("Model is none, cannot be saved!")
     else:
         torch.save(model.state_dict(),f"2model_trained/{filename}")
+# endregion 
 
+# region for DQN
 ##########################
-# for DQN using
 class SimpleNN(nn.Module):
     def __init__(self,input_size=4,output_size=2,hidden_size=128,num_layers=2):
         """
@@ -117,7 +119,7 @@ class Epsilon():
     def update(self):
         self.epsilon = max(self.epsilon * self.gamma, self.min_val)
 
-def select_action(state, env, model, epsilon = None, config = None, device="cpu"):
+def select_action(state, env, model, epsilon = None, config = None, device="cpu", update_epsilon = True):
     """
     整合了类型转换、epsilon-greedy，以及model前向传播。
     :param: state: numpy数组，来自env的直接输出。
@@ -129,12 +131,13 @@ def select_action(state, env, model, epsilon = None, config = None, device="cpu"
         state = torch.from_numpy(state).float().unsqueeze(0).to(device) # 添加一个新的维度，作为batchsize，在维度0处
         if config != None and config.DBM == True:
             print_(state)
-            print_(model(state))
-            print_(model(state).argmax())
+            #print_(model(state))
+            #print_(model(state).argmax())
         action = model(state).argmax().item()
         if config != None and config.DBM == True:
             print_(action)
-    epsilon.update()
+    if update_epsilon: # 这个是为了实现SARSA系统的策略在前后两次采样中保持不变而新增的。
+        epsilon.update()
     return action
 
 def update_model(model, target_model, memory, optimizer, gamma = 0.99, device = "cpu", config = None, batchsize = 30, total_step_num = 0, tau = 0.005):
@@ -194,3 +197,107 @@ def reward_func(env, x, x_dot, theta, theta_dot):
     r2 = (env.theta_threshold_radians - abs(theta)) / env.theta_threshold_radians - 0.5
     reward = r1 + r2
     return reward
+# endregion
+
+# region SARSA
+class Env_Config():
+    """
+    是的，只有两个参数唉，但是觉得更方便处理与监控
+    现在暂时用不到其他的东西，就先这样用了吧。
+    """
+    def __init__(self, obdim = 4, acdim = 4):
+        self.obdim = obdim
+        self.acdim = acdim
+    def print_cfg(self):
+        print("obdim:",self.obdim)
+        print("acdim:",self.acdim)
+
+def explain_env(env):
+    """yes, gym env"""
+    print("=== 动作空间 ===")
+    print(f"动作类型: {type(env.action_space)}")
+    print(f"动作数量: {env.action_space.n}")
+    print(f"动作范围: [0, {env.action_space.n-1}]")
+
+    print("\n=== 观测空间 ===")
+    print(f"观测类型: {type(env.observation_space)}")
+    print(f"观测维度: {env.observation_space.shape[0]}")
+    print(f"观测下界: {env.observation_space.low}")
+    print(f"观测上界: {env.observation_space.high}")
+
+    print("\n=== 环境参数 ===")
+    print(f"最大步数: {env._max_episode_steps}")
+
+class SARSA():
+    """
+    如果不指定的话，就全部按照默认的进行测试。也就是说默认的配置，epsilon的函数值，以及env_config。
+    """
+    def __init__(self, config = Config(), epsilon = Epsilon(),env_config = Env_Config(), device = "cpu"):
+        """
+        :inner_param: model: value network
+        """
+        self.gamma = config.gamma
+        self.lr = config.learning_rate
+        self.epsilon = epsilon.epsilon
+        self.model = SimpleNN(input_size=env_config.obdim,output_size=env_config.acdim).to(device=device)
+        self.optimizer = torch.optim.Adam(self.model.parameters(),lr=config.learning_rate)
+    def update(self, state:np.array, action:int, reward:float, next_state:np.array, predicted_action:int, device = "cpu",config = Config()):
+        """
+        :param: state: numpy数组，直接来自env输出。
+        :param: action: int
+        :param: predicted_action: 并未执行这个，所以是预测出来的。实际上是采样的结果，是对当前未更新的策略网络的一次估计。
+        """
+        # format conversion
+        state = torch.from_numpy(state).unsqueeze(0).float().to(device = device)
+        next_state = torch.from_numpy(next_state).unsqueeze(0).float().to(device = device)
+        action = torch.tensor([[action]]).long().to(device = device)
+        predicted_action = torch.tensor([[predicted_action]]).long().to(device = device)
+        reward = torch.tensor(reward).float().to(device = device).unsqueeze(0).unsqueeze(0)
+        # Q value calculate
+        q = self.model(state)
+        q_t_1 = self.model(next_state)
+        q = torch.gather(q,1,action)
+        q_t_1 = torch.gather(q_t_1, 1, predicted_action)
+        if config.DBM == True:
+            print_(q)
+            print_(q_t_1)
+        target_q = reward + self.gamma*q_t_1
+        target_q.detach() # 防止计算targetq的梯度，保证目标相对稳定？？
+        loss = self.model.loss(q, target_q)
+        self.model.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+        return
+
+def draw_in_ipynb(x_s = [None], y_s = [None], alpha_s = [None], label_s=["reward"], mark_s = [None], titletype = "auto", xlabel = 'Episode', ylabel = "reward",config = Config()):
+    """
+    注意这里的一些值是可以自己选择的啊。
+    """
+    # dynamic picture
+    import matplotlib.pyplot as plt
+    from IPython import display
+    # config test
+    #titletypes = ["auto"]
+    #if titletype not in titletypes:
+        #print(f"titletype {titletype} not in types {titletypes}")
+        #titletype = "auto"
+    assert len(x_s) == len(y_s) and len(x_s) == len(label_s) and len(x_s) == len(mark_s) and len(x_s) == len(alpha_s)
+    # pic draw
+    display.clear_output(wait=True)
+    plt.clf()
+    plt.figure(figsize=(15,6))
+    for i in range(len(y_s)):
+        if x_s[i] == None:
+            plt.plot(y_s[i],mark_s[i],alpha = alpha_s[i],label = label_s[i])
+        else:
+            plt.plot(x_s[i],y_s[i],mark_s[i],alpha = alpha_s[i],label = label_s[i])
+    if titletype == "auto":
+        plt.title(f'DQN Training (Episode {len(y_s[0])}/{config.max_episode})')
+    else:
+        plt.title(f"{titletype}")
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.legend()
+    display.display(plt.gcf())
+
+# endregion
