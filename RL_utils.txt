@@ -2,14 +2,13 @@ import torch
 import torch.nn as nn
 import time
 import numpy as np
-from collections import defaultdict
 
 # region general thing
 class Config():
     """
     用于配置整个算法的参数
     """
-    def __init__(self,max_episode=1000,max_steps=100,learning_rate=0.01,gamma=0.99,epsilon=0.1,seed=42,tau=0.01,DBM=True):
+    def __init__(self,max_episode=2000,max_steps=100,learning_rate=0.01,gamma=0.99,epsilon=0.1,DBM=True):
         # 训练参数
         self.max_episode = max_episode # 训练的次数
         self.max_steps = max_steps # 每次训练的最大步数
@@ -18,8 +17,6 @@ class Config():
         self.epsilon = epsilon # 探索率
         # 调试参数
         self.DBM = DBM
-        self.seed = seed
-        self.tau = tau
     
     def print_cfg(self):
         print("-"*3,"config","-"*3)
@@ -28,8 +25,6 @@ class Config():
         print("learning_rate:",self.learning_rate)
         print("gamma:",self.gamma)
         print("epsilon:",self.epsilon)
-        print("seed:",self.seed)
-        print("tau:",self.tau)
         print("-"*12)
 
 import inspect
@@ -70,23 +65,6 @@ def save_model(model = None, filename = "xxxmodel.pth"):
         print("Model is none, cannot be saved!")
     else:
         torch.save(model.state_dict(),f"2model_trained/{filename}")
-
-import random
-def set_seed(args):
-    """
-    注意给env也要设置seed啊：
-    state, _ = env.reset(seed=args.seed)
-    """
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    torch.cuda.manual_seed(args.seed)
-def soft_update(target_network, source_network, tau = 0.01):
-    """
-    直接来自05sarsa_v2.py文件唉。
-    """
-    for target_param, param in zip(target_network.parameters(), source_network.parameters()):
-        target_param.data.copy_(target_param.data * (1.0 - tau) + param.data * tau)
 # endregion 
 
 # region for DQN
@@ -122,6 +100,7 @@ class SimpleNN(nn.Module):
         return x
 
 from collections import deque
+import random
 class ReplayMemory():
     def __init__(self, capacity = 200):
         self.memory = deque(maxlen=capacity)
@@ -138,26 +117,18 @@ class ReplayMemory():
         return len(self.memory)
 
 class Epsilon():
-    def __init__(self, original_val = 0.01, gamma = 1, min_val = 1e-5, liner_decay = 1/2000):
-        """
-        添加linear decay的选项啊。
-        """
+    def __init__(self, original_val = 0.01, gamma = 1, min_val = 1e-5):
         self.epsilon = original_val
         self.gamma = gamma
-        self.max_val = original_val
         self.min_val = min_val
-        self.liner_decay = liner_decay
     def update(self):
         self.epsilon = max(self.epsilon * self.gamma, self.min_val)
-    def lin_update(self):
-        self.epsilon = max(self.epsilon - (self.max_val-self.min_val)*self.liner_decay, self.min_val)
 
 def select_action(state, env, model, epsilon = None, config = None, device="cpu", update_epsilon = True):
     """
     整合了类型转换、epsilon-greedy，以及model前向传播。
     :param: state: numpy数组，来自env的直接输出。
     :return: action:int，来自模型的输出。
-    注意这里修改为是默认使用线性方案实现更新啊。
     """
     if state is None:
         return None
@@ -173,7 +144,7 @@ def select_action(state, env, model, epsilon = None, config = None, device="cpu"
         if config != None and config.DBM == True:
             print_(action)
     if update_epsilon: # 这个是为了实现SARSA系统的策略在前后两次采样中保持不变而新增的。
-        epsilon.lin_update()
+        epsilon.update()
     return action
 
 def update_model(model, target_model, memory, optimizer, gamma = 0.99, device = "cpu", config = None, batchsize = 30, total_step_num = 0, tau = 0.005):
@@ -291,19 +262,16 @@ class SARSA():
     def __init__(self, config = Config(), epsilon = Epsilon(),env_config = Env_Config(), device = "cpu"):
         """
         :inner_param: model: value network
-        修改添加目标网络，保证训练的稳定性。
         """
         self.gamma = config.gamma
         self.lr = config.learning_rate
         self.epsilon = epsilon.epsilon
         self.model = SimpleNN(input_size=env_config.obdim,output_size=env_config.acdim).to(device=device)
-        self.target_model = SimpleNN(input_size=env_config.obdim,output_size=env_config.acdim).to(device=device)
-        self.target_model.load_state_dict(self.model.state_dict())
         self.optimizer = torch.optim.Adam(self.model.parameters(),lr=config.learning_rate)
     def update(self, state:np.array, action:int, reward:float, next_state:np.array, predicted_action:int, device = "cpu",config = Config()):
-        """ 
+        """
         :param: state: numpy数组，直接来自env输出。
-        :param: action: int，当前执行的动作。
+        :param: action: int
         :param: predicted_action: 并未执行这个，所以是预测出来的。实际上是采样的结果，是对当前未更新的策略网络的一次估计。
         """
         # format conversion
@@ -317,7 +285,7 @@ class SARSA():
         q = torch.gather(q,1,action)
         if next_state is not None:
             with torch.no_grad(): # new mod
-                q_t_1 = self.target_model(next_state)
+                q_t_1 = self.model(next_state)
                 q_t_1 = torch.gather(q_t_1, 1, predicted_action) # 新修改的q_t_1由模型输出也不计算梯度。
                 target_q = reward + self.gamma*q_t_1
         else:
@@ -325,15 +293,15 @@ class SARSA():
                 target_q = reward
         if config.DBM == True:
             print_(q)
-            print_(target_q)
+            #print_(q_t_1)
         loss = self.model.loss(q, target_q)
         self.model.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)  # 梯度裁剪
         self.optimizer.step()
-        return loss.item()
+        return
 
-def draw_in_ipynb(x_s = [None], y_s = [None], alpha_s = [None], label_s=["reward"], mark_s = [None], titletype = "auto",subject = "SARSA", xlabel = 'Episode', ylabel = "reward",config = Config()):
+def draw_in_ipynb(x_s = [None], y_s = [None], alpha_s = [None], label_s=["reward"], mark_s = [None], titletype = "auto", xlabel = 'Episode', ylabel = "reward",config = Config()):
     """
     注意这里的一些值是可以自己选择的啊。
     """
@@ -352,32 +320,11 @@ def draw_in_ipynb(x_s = [None], y_s = [None], alpha_s = [None], label_s=["reward
     plt.figure(figsize=(15,6))
     for i in range(len(y_s)):
         if x_s[i] == None:
-            line, = plt.plot(y_s[i],mark_s[i],alpha = alpha_s[i],label = label_s[i])
+            plt.plot(y_s[i],mark_s[i],alpha = alpha_s[i],label = label_s[i])
         else:
-            line, = plt.plot(x_s[i],y_s[i],mark_s[i],alpha = alpha_s[i],label = label_s[i])
-        
-        # 新添加部分：为包含"reward"的曲线添加标注
-        if "reward" in label_s[i].lower():
-            # 获取x轴数据（处理None情况）
-            x_data = x_s[i] if x_s[i] is not None else list(range(len(y_s[i])))
-            
-            # 在x为200倍数处添加标注
-            for j, x_val in enumerate(x_data):
-                if x_val % 50 == 0:  # 检查是否为200的倍数
-                    # 添加数值标签
-                    plt.annotate(
-                        f"{y_s[i][j]:.1f}",  # 显示reward值（保留1位小数）
-                        xy=(x_val, y_s[i][j]),
-                        xytext=(5, 5),  # 文本偏移量
-                        textcoords="offset points",
-                        fontsize=8,
-                        color=line.get_color()  # 使用曲线相同颜色
-                    )
-                    # 添加标记点
-                    plt.scatter(x_val, y_s[i][j], s=30, color=line.get_color(), edgecolor='white')
-
+            plt.plot(x_s[i],y_s[i],mark_s[i],alpha = alpha_s[i],label = label_s[i])
     if titletype == "auto":
-        plt.title(f'{subject} Training (Episode {len(y_s[0])}/{config.max_episode})')
+        plt.title(f'DQN Training (Episode {len(y_s[0])}/{config.max_episode})')
     else:
         plt.title(f"{titletype}")
     plt.xlabel(xlabel)

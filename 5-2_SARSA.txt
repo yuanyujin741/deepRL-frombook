@@ -1,0 +1,65 @@
+# -*- coding: utf-8 -*-
+# 自动生成自: 5-2_SARSA.ipynb
+
+# Cell [1]: 代码单元格
+# import everything here...
+%load_ext autoreload
+%autoreload 2
+from RL_utils import *
+%matplotlib inline
+
+# Cell [2]: 代码单元格
+# create env
+import gym
+env = gym.make("CartPole-v0",render_mode="human")
+config = Config(learning_rate=0.0001, DBM=True) # 使用默认配置
+if config.DBM:
+    config.print_cfg()
+
+# Cell [3]: 代码单元格
+# value network construction
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+if config.DBM:
+    print("using device:",device)
+env_cfg = Env_Config(obdim=env.observation_space.shape[0],acdim=env.action_space.n)
+if config.DBM:
+    env_cfg.print_cfg()
+epsilon = Epsilon()
+warmup = 200
+rewardnorm = RewardNormalizer(capacity = warmup)
+sarsa = SARSA(config=config, epsilon = epsilon, env_config=env_cfg, device = device) # optimizer inside of sarsa
+
+# Cell [4]: 代码单元格
+rewards = []
+total_steps = 0
+# training loop here
+for episode_num in range(config.max_episode):
+    state, info = env.reset()
+    done = False
+    total_reward = 0
+    action = select_action(state=state, env=env, model = sarsa.model, epsilon = epsilon, config=config, device=device, update_epsilon = False)
+    while True:
+        next_state, reward, done, truncated, info = env.step(action = action)
+        reward = rewardnorm.reward_func(env, *next_state)
+        total_steps+=1
+        if config.DBM:
+            print_(reward)
+        if done:
+            next_state = None
+        predicted_action = select_action(state=next_state, env=env, model = sarsa.model, epsilon = epsilon, config=config, device=device, update_epsilon = True)
+        if total_steps >= warmup:
+            rewardnorm.update()
+            norm_reward = rewardnorm.normalize(reward)
+            if config.DBM:
+                # print_(norm_reward)
+                pass
+            sarsa.update(state=state, action=action, reward=norm_reward, next_state=next_state, predicted_action=predicted_action,device=device,config = config)
+        state = next_state
+        total_reward += reward
+        # 新修改为使用predicted_action
+        action = predicted_action
+        if done or truncated:
+            break
+    rewards.append(total_reward)
+    draw_in_ipynb(x_s = [None], y_s=[rewards], alpha_s=[0.3], label_s=["reward"], mark_s=["b-"],config=config)
+
