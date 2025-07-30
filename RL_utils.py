@@ -4,12 +4,12 @@ import time
 import numpy as np
 from collections import defaultdict
 
-# region general thing
+# region gene
 class Config():
     """
     用于配置整个算法的参数
     """
-    def __init__(self,max_episode=1000,max_steps=100,learning_rate=0.01,gamma=0.99,epsilon=0.1,seed=42,tau=0.01,DBM=True):
+    def __init__(self,max_episode=3000,max_steps=100,learning_rate=0.01,gamma=0.99,epsilon=0.1,seed=42,tau=0.01,DBM=True):
         # 训练参数
         self.max_episode = max_episode # 训练的次数
         self.max_steps = max_steps # 每次训练的最大步数
@@ -89,7 +89,7 @@ def soft_update(target_network, source_network, tau = 0.01):
         target_param.data.copy_(target_param.data * (1.0 - tau) + param.data * tau)
 # endregion 
 
-# region for DQN
+# region DQN
 ##########################
 class SimpleNN(nn.Module):
     def __init__(self,input_size=4,output_size=2,hidden_size=128,num_layers=2):
@@ -255,7 +255,7 @@ class RewardNormalizer():
         return (reward - self.mean) / (self.std + 1e-5)
 # endregion
 
-# region SARSA
+# region  SAR SA
 class Env_Config():
     """
     是的，只有两个参数唉，但是觉得更方便处理与监控
@@ -363,7 +363,7 @@ def draw_in_ipynb(x_s = [None], y_s = [None], alpha_s = [None], label_s=["reward
             
             # 在x为200倍数处添加标注
             for j, x_val in enumerate(x_data):
-                if x_val % 50 == 0:  # 检查是否为200的倍数
+                if x_val % 20 == 0:  # 检查是否为20的倍数
                     # 添加数值标签
                     plt.annotate(
                         f"{y_s[i][j]:.1f}",  # 显示reward值（保留1位小数）
@@ -387,3 +387,38 @@ def draw_in_ipynb(x_s = [None], y_s = [None], alpha_s = [None], label_s=["reward
     plt.close() # 显式关闭图形，有助于防止内存泄漏，尤其是在频繁绘图时
 
 # endregion
+
+# region Monte Carlo
+class MonteCarlo():
+    def __init__(self,env_config=Env_Config(),config=Config(),device = "cpu"):
+        self.model = SimpleNN(input_size=env_config.obdim,output_size=env_config.acdim).to(device)
+        self.lr = config.learning_rate
+        self.gamma = config.gamma
+        self.device = device
+        self.optimizer = torch.optim.Adam(self.model.parameters(),lr=config.learning_rate)
+
+    def update(self,episode_reward_list:list,episode_state_list:list, episode_action_list):
+        """
+        因为需要在一个episode之后就进行更新，所以这里就直接使用全部的一个episode的全部rewards进行更新。
+        那么应该怎么进行更新呢？尝试使用全部loss的mean进行更新。
+        """
+        # 首先进行格式转换
+        #episode_reward_list = torch.tensor(episode_reward_list).unsqueeze(1).to(self.device)
+        episode_action_list = torch.tensor(episode_action_list).unsqueeze(1).to(self.device)
+        episode_state_list = torch.from_numpy(np.array(episode_state_list)).to(self.device)
+        # 然后计算loss
+        model_return = torch.gather(self.model(episode_state_list),1,episode_action_list)
+        actual_return = []
+        returns = 0
+        for i in range(len(episode_reward_list)-1,-1,-1): # i as index
+            returns = returns*self.gamma + episode_reward_list[i]
+            actual_return.append(returns)
+        actual_return.reverse()
+        actual_return = torch.tensor(actual_return).unsqueeze(1).to(device=self.device) # !!!!! 这里还是不太理解，就是关于unsqueeze的问题啊，需要时unsqueeze(1)才是我们需要的那种一行一个对象的样子。
+        loss = self.model.loss(model_return, actual_return)
+        self.model.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+        return loss.item()
+
+        
