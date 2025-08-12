@@ -3,33 +3,41 @@ import torch.nn as nn
 import time
 import numpy as np
 from collections import defaultdict
+import os
+import matplotlib.pyplot as plt
 
 # region gene
 class Config():
     """
     用于配置整个算法的参数
     """
-    def __init__(self,max_episode=3000,max_steps=100,learning_rate=0.01,gamma=0.99,epsilon=0.1,seed=42,tau=0.01,DBM=True):
+    def __init__(self,max_episode=3000,max_steps=100,learning_rate=0.001,gamma=0.97,epsilon=0.1,continue_training= False,seed=42,tau=0.01,capacity=5e5,warmup=1000,batch_size = 256, env_config=None,DBM=True):
         # 训练参数
         self.max_episode = max_episode # 训练的次数
         self.max_steps = max_steps # 每次训练的最大步数
         self.learning_rate = learning_rate # 学习率
         self.gamma = gamma # 折扣因子
         self.epsilon = epsilon # 探索率
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.continue_training = continue_training
         # 调试参数
         self.DBM = DBM
         self.seed = seed
         self.tau = tau
+        self.capacity = capacity # 课本建议的经验回放容量为1e5~1e6
+        self.warmup = warmup # 经验回放预热次数
+        self.batch_size = batch_size # 每次更新的时候选择的样本数量
+        # 环境参数
+        self.env_config = env_config.__dict__ if env_config is not None else {'obdim': 4, 'acdim': 2}
+        # 可视化参数
+        self.plot_dots = 1000 # 例如0~1000绘制一张，1000~2000绘制一张，以此类推
+        # 测试参数
+        self.test_num = 10 # 训练10次
     
     def print_cfg(self):
         print("-"*3,"config","-"*3)
-        print("max_episode:",self.max_episode)
-        print("max_steps:",self.max_steps)
-        print("learning_rate:",self.learning_rate)
-        print("gamma:",self.gamma)
-        print("epsilon:",self.epsilon)
-        print("seed:",self.seed)
-        print("tau:",self.tau)
+        for k,v in self.__dict__.items():
+            print(f"* {k}: {v}")
         print("-"*12)
 
 import inspect
@@ -55,21 +63,27 @@ def print_(*args):
     finally:
         del frame  # 避免内存泄漏
 
-def save_data(rewards = [], filename = "xxxrewards.pkl"):
+def save_data(rewards = [], subpath = "DDQN", filename = "xxxrewards.pkl"):
     """
     save rewards to 1data_saved
+    :param: subpath: str, subpath to save
     :param: rewards: list of rewards
     :param: filename: str, filename to save
     """
+    os.makedirs(f"1data_saved/{subpath}",exist_ok=True)
+    filename = f"1data_saved/{subpath}/{filename}"
     import pickle
-    with open(f"1data_saved/{filename}", "wb") as f:
+    with open(filename, "wb") as f:
         pickle.dump(rewards, f)
 
-def save_model(model = None, filename = "xxxmodel.pth"):
+def save_model(model = None,subpath = "DDQN", filename = "xxxmodel.pth"):
+    os.makedirs(f"2model_trained/{subpath}",exist_ok=True)
+    filename = f"2model_trained/{subpath}/{filename}"
     if model is None:
         print("Model is none, cannot be saved!")
     else:
-        torch.save(model.state_dict(),f"2model_trained/{filename}")
+        torch.save(model.state_dict(),filename)
+        print(f"Model saved to {filename}")
 
 import random
 def set_seed(args):
@@ -123,8 +137,11 @@ class SimpleNN(nn.Module):
 
 from collections import deque
 class ReplayMemory():
-    def __init__(self, capacity = 200):
-        self.memory = deque(maxlen=capacity)
+    """
+    droped one, still keep, for old codes.
+    """
+    def __init__(self, capacity:int|float = 200):
+        self.memory = deque(maxlen=int(capacity))
     
     def push(self, state, action, reward, next_state):
         """
@@ -136,6 +153,37 @@ class ReplayMemory():
     
     def __len__(self):
         return len(self.memory)
+
+class ReplayMemory_2(ReplayMemory):
+    """
+    新增一个版本的replay memory，用于存储五元组。只需要重写push就好了。
+    """
+    def __int__(self, capacity = 200):
+        super().__init__(capacity=capacity)
+    def push(self, state, action, reward, next_state, done):
+        self.memory.append((state, action, reward, next_state, done))
+
+def save_buffer(buffer:ReplayMemory_2,subpath="DDQN", filename = "xxxbuffer.pkl"):
+    """
+    用于保存buffer，方便下次训练或者是续训练。test done
+    """
+    import pickle
+    os.makedirs(f"1data_saved/{subpath}", exist_ok=True)
+    filename = f"1data_saved/{subpath}/{filename}"
+    with open(filename, "wb") as f:
+        pickle.dump(buffer.memory, f)
+        print(f"Buffer saved to {filename}")
+def load_buffer(buffer:ReplayMemory_2,subpath="DDQN", filename = "xxxbuffer.pkl"):
+    """
+    用于加载buffer，方便续训练。 test done
+    """
+    import pickle
+    filename = f"1data_saved/{subpath}/{filename}"
+    with open(filename, "rb") as f:
+        memory = pickle.load(f)
+        buffer.memory = deque(memory)
+        print(f"Buffer loaded from {filename}")
+        return buffer
 
 class Epsilon():
     def __init__(self, original_val = 0.01, gamma = 1, min_val = 1e-5, liner_decay = 1/2000):
@@ -152,7 +200,7 @@ class Epsilon():
     def lin_update(self):
         self.epsilon = max(self.epsilon - (self.max_val-self.min_val)*self.liner_decay, self.min_val)
 
-def select_action(state, env, model, epsilon = None, config = None, device="cpu", update_epsilon = True):
+def select_action(state, env, model, epsilon:Epsilon|float|int = None, config = None, device="cpu", update_epsilon = True):
     """
     整合了类型转换、epsilon-greedy，以及model前向传播。
     :param: state: numpy数组，来自env的直接输出。
@@ -161,6 +209,8 @@ def select_action(state, env, model, epsilon = None, config = None, device="cpu"
     """
     if state is None:
         return None
+    if isinstance(epsilon,float) or isinstance(epsilon,int):
+        epsilon = Epsilon(original_val=epsilon,min_val=epsilon) # 不论如何都不进行更新，也就是说保持恒定，即使进行了更新
     if np.random.rand() < epsilon.epsilon:
         action = env.action_space.sample()
     else:
@@ -333,9 +383,10 @@ class SARSA():
         self.optimizer.step()
         return loss.item()
 
-def draw_in_ipynb(x_s = [None], y_s = [None], alpha_s = [None], label_s=["reward"], mark_s = [None], titletype = "auto",subject = "SARSA", xlabel = 'Episode', ylabel = "reward",config = Config()):
+def draw_in_ipynb(x_s = [None], y_s = [None], alpha_s = [None], label_s=["reward"], mark_s = [None], titletype = "auto",subject = "SARSA", xlabel = 'Episode', ylabel = "reward",config = Config(),save_figure = False,file_subpath = None,filename = None):
     """
     注意这里的一些值是可以自己选择的啊。
+    新增关于保存的代码。
     """
     # dynamic picture
     import matplotlib.pyplot as plt
@@ -383,6 +434,9 @@ def draw_in_ipynb(x_s = [None], y_s = [None], alpha_s = [None], label_s=["reward
     plt.xlabel(xlabel)
     plt.ylabel(ylabel)
     plt.legend()
+    if save_figure:
+        plt.savefig(f"1data_saved/{file_subpath}/{filename}")
+        #print("figre saved")
     display.display(plt.gcf())
     plt.close() # 显式关闭图形，有助于防止内存泄漏，尤其是在频繁绘图时
 
@@ -421,4 +475,44 @@ class MonteCarlo():
         self.optimizer.step()
         return loss.item()
 
-        
+# region DDQN
+class DDQN():
+    def __init__(self, config:Config,epsilon:Epsilon):
+        self.target_model = SimpleNN(input_size=config.env_config["obdim"],output_size=config.env_config["acdim"]).to(config.device)
+        self.model = SimpleNN(input_size=config.env_config["obdim"],output_size=config.env_config["acdim"]).to(config.device)
+        self.target_model.load_state_dict(self.model.state_dict())
+        self.optimizer = torch.optim.Adam(self.model.parameters(),lr=config.learning_rate)
+        self.config = config
+        self.epsilon = epsilon.epsilon
+    def update(self,buffer:ReplayMemory_2):
+        """
+        从buffer中采集数据进行参数更新就是了。
+        只需要注意的是完全参考self.config做更新。 Book Page 85
+        """
+        # sample + convert to tensor
+        batch = buffer.sample(self.config.batch_size)
+        states = [batch[i][0] for i in range(len(batch))]
+        states = torch.from_numpy(np.array(states)).to(self.config.device)
+        actions = [batch[i][1] for i in range(len(batch))]
+        actions = torch.tensor(actions).unsqueeze(1).to(self.config.device) # 仍然不太理解这里是怎么体现的。
+        rewards = [batch[i][2] for i in range(len(batch))]
+        rewards = torch.tensor(rewards).unsqueeze(1).to(self.config.device)
+        next_states = [batch[i][3] for i in range(len(batch))]
+        next_states = torch.from_numpy(np.array(next_states)).to(self.config.device)
+        dones = [batch[i][4] for i in range(len(batch))]
+        dones = torch.tensor(dones).unsqueeze(1).to(torch.long).to(self.config.device)
+        # follow the book's instruction
+        q = self.model(states)
+        q = torch.gather(q,1,actions)
+        with torch.no_grad():
+            a_predicted = self.model(next_states).argmax(1).unsqueeze(1)
+            q_next = self.target_model(next_states)
+            q_next = torch.gather(q_next,1,a_predicted)
+            q_target = rewards + (1-dones)*self.config.gamma*q_next
+        loss = self.model.loss(q,q_target)
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+        # soft update the target model
+        soft_update(self.target_model,self.model,self.config.tau)
+        return loss.item()
